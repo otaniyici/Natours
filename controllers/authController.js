@@ -28,6 +28,7 @@ const createSendToken = (user, statusCode, res) => {
   res.cookie('jwt', token, cookieOptions);
 
   user.password = undefined;
+  user.emailValidated = undefined;
 
   res.status(statusCode).json({
     status: 'success',
@@ -38,12 +39,50 @@ const createSendToken = (user, statusCode, res) => {
   });
 };
 
-exports.signup = catchAsync(async (req, res, next) => {
-  const { valid } = await isEmailValid(req.body.email);
-
-  if (!valid) {
-    return next(new AppError('Plese use a valid email address!'), 400);
+const validationEmailSender = catchAsync(async (req, res, next) => {
+  // 1) Get user based on POSTed email
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    return next(new AppError('There is no user with that email address.', 404));
   }
+
+  // 2) Generate the random token
+  const resetToken = user.createEmailValidationToken(60);
+  await user.save({ validateBeforeSave: false });
+
+  // 3) Send it to user's email
+  const resetURL = `${req.protocol}://${req.get(
+    'host'
+  )}/api/v1/users/validateEmail/${resetToken}`;
+
+  const message = `Please validate your email by a PATCH request to: ${resetURL}.\n`;
+
+  try {
+    await sendEmail({
+      email: user.email,
+      subject: 'Your validation token (valid for 1 hour)',
+      message,
+    });
+  } catch (err) {
+    user.passwordResetToken = undefined;
+    user.passwordResetExpires = undefined;
+    await user.save({ validateBeforeSave: false });
+
+    return next(
+      new AppError('There was an error sending the email. Try again later!'),
+      500
+    );
+  }
+
+  // res.status(200).json({ status: 'success', message: 'Token sent to email!' });
+});
+
+exports.signup = catchAsync(async (req, res, next) => {
+  // const { valid } = await isEmailValid(req.body.email);
+
+  // if (!valid) {
+  //   return next(new AppError('Plese use a valid email address!'), 400);
+  // }
 
   const newUser = await User.create({
     name: req.body.name,
@@ -52,6 +91,10 @@ exports.signup = catchAsync(async (req, res, next) => {
     passwordConfirm: req.body.passwordConfirm,
     role: req.body.role,
   });
+
+  req.user = newUser;
+
+  await validationEmailSender(req, res, next);
 
   createSendToken(newUser, 201, res);
 });
@@ -65,7 +108,13 @@ exports.login = catchAsync(async (req, res, next) => {
   }
 
   // 2) Check if user exits && password is correct
-  const user = await User.findOne({ email }).select('+password');
+  const user = await User.findOne({ email }).select(
+    '+password +emailValidated'
+  );
+
+  if (!user.emailValidated) {
+    next(new AppError('Please validate your email!'));
+  }
 
   if (!user || !(await user.correctPassword(password, user.password))) {
     return next(new AppError('Incorrect email or password', 401));
@@ -134,7 +183,7 @@ exports.forgotPassword = catchAsync(async (req, res, next) => {
   }
 
   // 2) Generate the random token
-  const resetToken = user.createPasswordResetToken();
+  const resetToken = user.createPasswordResetToken(10);
   await user.save({ validateBeforeSave: false });
 
   // 3) Send it to user's email
@@ -162,6 +211,31 @@ exports.forgotPassword = catchAsync(async (req, res, next) => {
   }
 
   res.status(200).json({ status: 'success', message: 'Token sent to email!' });
+});
+
+exports.validateEmail = catchAsync(async (req, res, next) => {
+  // 1) Get user based on the token
+  const hashedToken = crypto
+    .createHash('sha256')
+    .update(req.params.token)
+    .digest('hex');
+
+  const user = await User.findOne({
+    emailValidationToken: hashedToken,
+    emailValidationExpires: { $gt: Date.now() },
+  });
+  // 2) If token has not expired, and there is user, set the new password
+  if (!user) {
+    return next(new AppError('Token is invalid or has expired', 400));
+  }
+  user.emailValidationToken = undefined;
+  user.emailValidationExpires = undefined;
+  user.emailValidated = true;
+  await user.save({ validateBeforeSave: false });
+
+  // 3) Update changedPasswordAt property for the user
+  // 4) Log the user in, send JWT
+  createSendToken(user, 200, res);
 });
 
 exports.resetPassword = catchAsync(async (req, res, next) => {
